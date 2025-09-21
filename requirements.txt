@@ -1,0 +1,13 @@
+backtrader
+ccxt
+matplotlib
+numpy
+pandas
+plotly
+pytz
+requests
+scikit-learn
+streamlit
+streamlit-autorefresh
+torch
+transformers
