@@ -45,6 +45,17 @@ EXPECTED_RAW_COLUMNS = [
 ]
 
 
+EXPORTED_FEATURE_KEYS = [
+    "feat_atr_30m_pct",
+    "feat_atr_60m_pct",
+    "feat_realized_vol_60m",
+    "feat_realized_vol_60m_annual",
+    "feat_vol_z_60m",
+    "feat_volume_rate_30m",
+]
+
+
+
 def _clean_field(value: str | float | int | None) -> str:
     if value is None:
         return ""
@@ -225,9 +236,10 @@ def magnitude_bucket(thresholds: Dict[str, Dict[str, float]] | None, value: floa
     q2 = bucket.get("q2", 0.0)
     if np.isnan(value):
         return "unknown"
-    if value < q1:
+    abs_val = abs(value)
+    if abs_val < q1:
         return "small"
-    if value < q2:
+    if abs_val < q2:
         return "medium"
     return "large"
 
@@ -244,7 +256,12 @@ def ensure_output_header():
         "prob_neut",
         "prob_bull",
         "confidence",
+        "ret_pred",
+        "ret_30m_pred",
+        "ret_120m_pred",
         "mag_pred",
+        "mag_30m_pred",
+        "mag_120m_pred",
         "mag_bucket",
         "features_status",
         "title",
@@ -253,6 +270,7 @@ def ensure_output_header():
         "source",
         "processed_at",
     ]
+    header.extend(EXPORTED_FEATURE_KEYS)
     OUTPUT_CSV.write_text(",".join(header) + "\n", encoding="utf-8")
 
 
@@ -352,8 +370,18 @@ def run_loop():
                 pred_idx = int(probs.argmax())
                 label = LABELS[pred_idx]
                 confidence = float(probs[pred_idx])
+
+                ret_30 = float(g30.cpu().numpy().reshape(-1)[0])
+                ret_60 = float(g60.cpu().numpy().reshape(-1)[0])
+                ret_120 = float(g120.cpu().numpy().reshape(-1)[0])
+                mag_val = abs(ret_60)
+                bucket = magnitude_bucket(assets.thresholds, ret_60)
+
+                feature_exports = {key: feats.get(key) for key in EXPORTED_FEATURE_KEYS}
+
                 mag_val = float(g60.cpu().numpy().reshape(-1)[0])
                 bucket = magnitude_bucket(assets.thresholds, mag_val)
+
 
                 processed_ids.append(news_id)
                 processed_set.add(news_id)
@@ -371,7 +399,12 @@ def run_loop():
                     "prob_neut": round(float(probs[1]), 6),
                     "prob_bull": round(float(probs[2]), 6),
                     "confidence": round(confidence, 6),
+                    "ret_pred": round(ret_60, 6),
+                    "ret_30m_pred": round(ret_30, 6),
+                    "ret_120m_pred": round(ret_120, 6),
                     "mag_pred": round(mag_val, 6),
+                    "mag_30m_pred": round(abs(ret_30), 6),
+                    "mag_120m_pred": round(abs(ret_120), 6),
                     "mag_bucket": bucket,
                     "features_status": features_status,
                     "title": title,
@@ -380,12 +413,13 @@ def run_loop():
                     "source": source,
                     "processed_at": pd.Timestamp.utcnow().isoformat(),
                 }
+                out_row.update({k: (None if v is None else float(v)) for k, v in feature_exports.items()})
 
                 df_out = pd.DataFrame([out_row])
                 df_out.to_csv(OUTPUT_CSV, mode="a", header=False, index=False)
                 print(
                     f"[PRED] {news_id} | {label} conf={confidence:.2f} "
-                    f"bull={probs[2]:.2f} bear={probs[0]:.2f} mag={mag_val:.4f}"
+                    f"bull={probs[2]:.2f} bear={probs[0]:.2f} ret={ret_60:.4f} mag={mag_val:.4f}"
                 )
         except Exception as exc:
             print("[ERROR]", exc)
