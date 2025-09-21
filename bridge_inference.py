@@ -44,6 +44,7 @@ EXPECTED_RAW_COLUMNS = [
     "news_id",
 ]
 
+
 EXPORTED_FEATURE_KEYS = [
     "feat_atr_30m_pct",
     "feat_atr_60m_pct",
@@ -52,6 +53,7 @@ EXPORTED_FEATURE_KEYS = [
     "feat_vol_z_60m",
     "feat_volume_rate_30m",
 ]
+
 
 
 def _clean_field(value: str | float | int | None) -> str:
@@ -368,6 +370,7 @@ def run_loop():
                 pred_idx = int(probs.argmax())
                 label = LABELS[pred_idx]
                 confidence = float(probs[pred_idx])
+
                 ret_30 = float(g30.cpu().numpy().reshape(-1)[0])
                 ret_60 = float(g60.cpu().numpy().reshape(-1)[0])
                 ret_120 = float(g120.cpu().numpy().reshape(-1)[0])
@@ -375,6 +378,10 @@ def run_loop():
                 bucket = magnitude_bucket(assets.thresholds, ret_60)
 
                 feature_exports = {key: feats.get(key) for key in EXPORTED_FEATURE_KEYS}
+
+                mag_val = float(g60.cpu().numpy().reshape(-1)[0])
+                bucket = magnitude_bucket(assets.thresholds, mag_val)
+
 
                 processed_ids.append(news_id)
                 processed_set.add(news_id)
