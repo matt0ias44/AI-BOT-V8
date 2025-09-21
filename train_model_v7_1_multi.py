@@ -4,7 +4,7 @@
 train_model_v7_1_multi.py
 Multi-tâche & multi-modal :
 - Direction (bearish/neutral/bullish) : classification 3 classes sur 30/60/120m
-- Amplitude (|ret|) : régression continue sur 30/60/120m (HuberLoss)
+- Amplitude (retour signé) : régression continue sur 30/60/120m (HuberLoss)
 - Fusion Texte (DeBERTa) + Features marché (feat_*)
 
 Prérequis dataset :
@@ -13,6 +13,7 @@ Prérequis dataset :
   * event_time (UTC ISO)
   * titles_joined, body_concat (texte)
   * label_30m, label_60m, label_120m ∈ {bearish, neutral, bullish}
+  * ret_30m, ret_60m, ret_120m (rendements signés)
   * mag_30m, mag_60m, mag_120m (amplitude continue, |ret|)
   * feat_* (features marché à t0)
 
@@ -63,12 +64,16 @@ EARLY_STOP_PATIENCE = 2
 # Pertes / pondération
 FOCAL_GAMMA = 2.0           # ↑ renforcé (était 1.5)
 LAMBDA_DIR = 1.2            # ↑ priorité direction (était 1.0)
-LAMBDA_MAG = 0.5            # ↓ amplitude un peu moins pondérée (était 0.6)
-HUBER_DELTA = 0.005         # delta Huber sur |ret| (à ajuster selon échelle de |ret|)
+LAMBDA_RET = 0.6            # pondération de la perte de retour signé
+HUBER_DELTA = 0.004         # delta Huber sur ret (à ajuster selon échelle de ret)
 
 # Labels / classes
 LABELS = ["bearish","neutral","bullish"]
 NUM_LABELS = 3
+
+RET_COLS = ["ret_30m", "ret_60m", "ret_120m"]
+MAG_COLS = ["mag_30m", "mag_60m", "mag_120m"]
+LABEL_TO_SIGN = {"bearish": -1.0, "neutral": 0.0, "bullish": 1.0}
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -151,7 +156,11 @@ def learn_mag_thresholds(train_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     """
     thresholds = {}
     for h in [30,60,120]:
-        vals = train_df[f"mag_{h}m"].dropna().values
+        col_ret = f"ret_{h}m"
+        if col_ret in train_df.columns:
+            vals = np.abs(train_df[col_ret].dropna().values)
+        else:
+            vals = train_df[f"mag_{h}m"].dropna().values
         if len(vals) < 100:
             q1, q2 = 0.0025, 0.0070
         else:
@@ -167,11 +176,12 @@ def mag_to_class(x: float, q1: float, q2: float) -> int:
     return 2
 
 class MultiModalDataset(Dataset):
-    def __init__(self, texts_enc, feat_mat, y_dir, y_mag):
+    def __init__(self, texts_enc, feat_mat, y_dir, y_ret, y_abs):
         self.enc = texts_enc          # dict with input_ids, attention_mask (torch.Tensor)
         self.feat = feat_mat          # torch.FloatTensor [N, F]
         self.y_dir = y_dir            # dict horizon-> Long
-        self.y_mag = y_mag            # dict horizon-> Float (|ret|)
+        self.y_ret = y_ret            # dict horizon-> Float (ret signé)
+        self.y_abs = y_abs            # dict horizon-> Float (|ret|)
     def __len__(self): return self.enc["input_ids"].shape[0]
     def __getitem__(self, idx):
         return (
@@ -179,7 +189,8 @@ class MultiModalDataset(Dataset):
             self.enc["attention_mask"][idx],
             self.feat[idx],
             self.y_dir[30][idx], self.y_dir[60][idx], self.y_dir[120][idx],
-            self.y_mag[30][idx], self.y_mag[60][idx], self.y_mag[120][idx],
+            self.y_ret[30][idx], self.y_ret[60][idx], self.y_ret[120][idx],
+            self.y_abs[30][idx], self.y_abs[60][idx], self.y_abs[120][idx],
         )
 
 # =====================
@@ -271,19 +282,21 @@ class EarlyStopping:
 @torch.no_grad()
 def evaluate(model, loader, thresholds):
     model.eval()
-    true_dir = {30:[],60:[],120:[]}
-    pred_dir = {30:[],60:[],120:[]}
-    true_mag = {30:[],60:[],120:[]}
-    pred_mag = {30:[],60:[],120:[]}
+    true_dir = {30: [], 60: [], 120: []}
+    pred_dir = {30: [], 60: [], 120: []}
+    true_ret = {30: [], 60: [], 120: []}
+    pred_ret = {30: [], 60: [], 120: []}
+    true_abs = {30: [], 60: [], 120: []}
 
-    for ids, mask, feats, y30, y60, y120, m30, m60, m120 in loader:
+    for ids, mask, feats, y30, y60, y120, r30, r60, r120, a30, a60, a120 in loader:
         ids = ids.to(DEVICE); mask = mask.to(DEVICE); feats = feats.to(DEVICE)
         (o30,o60,o120), (g30,g60,g120) = model(ids, mask, feats)
         p30 = o30.argmax(-1).cpu(); p60 = o60.argmax(-1).cpu(); p120 = o120.argmax(-1).cpu()
         true_dir[30].append(y30); true_dir[60].append(y60); true_dir[120].append(y120)
         pred_dir[30].append(p30); pred_dir[60].append(p60); pred_dir[120].append(p120)
-        true_mag[30].append(m30); true_mag[60].append(m60); true_mag[120].append(m120)
-        pred_mag[30].append(g30.cpu()); pred_mag[60].append(g60.cpu()); pred_mag[120].append(g120.cpu())
+        true_ret[30].append(r30); true_ret[60].append(r60); true_ret[120].append(r120)
+        pred_ret[30].append(g30.cpu()); pred_ret[60].append(g60.cpu()); pred_ret[120].append(g120.cpu())
+        true_abs[30].append(a30); true_abs[60].append(a60); true_abs[120].append(a120)
 
     res = {}
     for h in [30,60,120]:
@@ -292,13 +305,16 @@ def evaluate(model, loader, thresholds):
         acc = float(accuracy_score(yt, yp))
         f1  = float(f1_score(yt, yp, average="macro"))
 
-        tm = torch.cat(true_mag[h]).numpy()
-        pm = torch.cat(pred_mag[h]).numpy()
+        tm = torch.cat(true_ret[h]).numpy()
+        pm = torch.cat(pred_ret[h]).numpy()
         mae = float(mean_absolute_error(tm, pm))
-        # classification magnitude via seuils
+
+        true_abs_vals = torch.cat(true_abs[h]).numpy()
+        pred_abs_vals = np.abs(pm)
+
         q1 = thresholds[str(h)]["q1"]; q2 = thresholds[str(h)]["q2"]
-        tm_cls = np.array([0 if np.isnan(x) or x<q1 else (1 if x<q2 else 2) for x in tm])
-        pm_cls = np.array([0 if x<q1 else (1 if x<q2 else 2) for x in pm])
+        tm_cls = np.array([0 if np.isnan(x) or x<q1 else (1 if x<q2 else 2) for x in true_abs_vals])
+        pm_cls = np.array([0 if x<q1 else (1 if x<q2 else 2) for x in pred_abs_vals])
         # enlever NaN labels
         mask = tm_cls >= 0
         if mask.sum() > 0:
@@ -315,11 +331,18 @@ def evaluate(model, loader, thresholds):
             spr = 0.0
 
         res[h] = {
-            "dir_acc": acc, "dir_f1": f1,
-            "mag_mae": mae, "mag_acc_cls": acc_mag, "mag_f1_cls": f1_mag,
-            "mag_spearman": spr,
-            "dir_y_true": yt.tolist(), "dir_y_pred": yp.tolist(),
-            "mag_y_true": tm.tolist(), "mag_y_pred": pm.tolist(),
+            "dir_acc": acc,
+            "dir_f1": f1,
+            "ret_mae": mae,
+            "mag_acc_cls": acc_mag,
+            "mag_f1_cls": f1_mag,
+            "ret_spearman": spr,
+            "dir_y_true": yt.tolist(),
+            "dir_y_pred": yp.tolist(),
+            "ret_y_true": tm.tolist(),
+            "ret_y_pred": pm.tolist(),
+            "abs_y_true": true_abs_vals.tolist(),
+            "abs_y_pred": pred_abs_vals.tolist(),
         }
     return res
 
@@ -338,12 +361,35 @@ def main():
 
     # ----- Load data -----
     df = pd.read_csv(DATA_FILE)
-    for c in ["label_30m","label_60m","label_120m","mag_30m","mag_60m","mag_120m"]:
+
+    # Vérification colonnes directionnelles
+    label_cols = [f"label_{h}m" for h in [30, 60, 120]]
+    for c in label_cols:
         if c not in df.columns:
             raise ValueError(f"Missing column: {c}")
-    for c in ["label_30m","label_60m","label_120m"]:
+
+    for col in RET_COLS:
+        if col not in df.columns:
+            horizon = col.split("_")[1]
+            mag_col = f"mag_{horizon}"
+            label_col = f"label_{horizon}"
+            if mag_col not in df.columns or label_col not in df.columns:
+                raise ValueError(f"Unable to reconstruct {col}: missing {mag_col} or {label_col}")
+            signs = df[label_col].map(LABEL_TO_SIGN).astype(float)
+            df[col] = df[mag_col].astype(float) * signs
+
+    for h in [30, 60, 120]:
+        mag_col = f"mag_{h}m"
+        ret_col = f"ret_{h}m"
+        if mag_col not in df.columns:
+            df[mag_col] = df[ret_col].abs()
+
+    for c in label_cols:
         df = df[df[c].isin(LABELS)]
-    df = df.dropna(subset=["mag_30m","mag_60m","mag_120m"]).reset_index(drop=True)
+
+    df = df.dropna(subset=RET_COLS).reset_index(drop=True)
+    for col in RET_COLS + MAG_COLS:
+        df[col] = df[col].astype(float)
 
     # split temporel
     train_df, val_df = temporal_split(df, val_ratio=0.2, time_col=TIME_COL)
@@ -372,8 +418,14 @@ def main():
     val_feats = apply_feature_norm(val_df[feat_cols].astype(float), feat_norm)
 
     # labels
-    def to_dir(y): return torch.tensor([LABELS.index(v) for v in y], dtype=torch.long)
-    def to_mag(y): return torch.tensor(y.astype(float).values, dtype=torch.float)
+    def to_dir(y):
+        return torch.tensor([LABELS.index(v) for v in y], dtype=torch.long)
+
+    def to_ret(y):
+        return torch.tensor(y.astype(float).values, dtype=torch.float)
+
+    def to_abs(y):
+        return torch.tensor(np.abs(y.astype(float).values), dtype=torch.float)
 
     y_dir_train = {
         30: to_dir(train_df["label_30m"]),
@@ -385,15 +437,26 @@ def main():
         60: to_dir(val_df["label_60m"]),
         120: to_dir(val_df["label_120m"]),
     }
-    y_mag_train = {
-        30: to_mag(train_df["mag_30m"]),
-        60: to_mag(train_df["mag_60m"]),
-        120: to_mag(train_df["mag_120m"]),
+    y_ret_train = {
+        30: to_ret(train_df["ret_30m"]),
+        60: to_ret(train_df["ret_60m"]),
+        120: to_ret(train_df["ret_120m"]),
     }
-    y_mag_val = {
-        30: to_mag(val_df["mag_30m"]),
-        60: to_mag(val_df["mag_60m"]),
-        120: to_mag(val_df["mag_120m"]),
+    y_ret_val = {
+        30: to_ret(val_df["ret_30m"]),
+        60: to_ret(val_df["ret_60m"]),
+        120: to_ret(val_df["ret_120m"]),
+    }
+
+    y_abs_train = {
+        30: to_abs(train_df["mag_30m"]),
+        60: to_abs(train_df["mag_60m"]),
+        120: to_abs(train_df["mag_120m"]),
+    }
+    y_abs_val = {
+        30: to_abs(val_df["mag_30m"]),
+        60: to_abs(val_df["mag_60m"]),
+        120: to_abs(val_df["mag_120m"]),
     }
 
     # encodage texte
@@ -405,8 +468,8 @@ def main():
     Xf_val   = torch.tensor(val_feats.values, dtype=torch.float)
 
     # datasets / loaders
-    train_ds = MultiModalDataset(enc_train, Xf_train, y_dir_train, y_mag_train)
-    val_ds   = MultiModalDataset(enc_val,   Xf_val,   y_dir_val,   y_mag_val)
+    train_ds = MultiModalDataset(enc_train, Xf_train, y_dir_train, y_ret_train, y_abs_train)
+    val_ds   = MultiModalDataset(enc_val,   Xf_val,   y_dir_val,   y_ret_val,   y_abs_val)
 
     # sampler pour l'imbalance direction (60m comme référence)
     y60 = y_dir_train[60]
@@ -436,7 +499,7 @@ def main():
         dir60_loss = nn.CrossEntropyLoss(weight=w60)
         dir120_loss = nn.CrossEntropyLoss(weight=w120)
 
-    mag_loss = nn.HuberLoss(delta=HUBER_DELTA)  # régression |ret|
+    ret_loss = nn.HuberLoss(delta=HUBER_DELTA)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     total_steps = len(train_loader) * EPOCHS
@@ -455,17 +518,17 @@ def main():
         loop = tqdm(train_loader, desc=f"Epoch {ep}", leave=True)
         tr_loss = 0.0
 
-        for ids, mask, feats, y30, y60, y120, m30, m60, m120 in loop:
+        for ids, mask, feats, y30, y60, y120, r30, r60, r120, a30, a60, a120 in loop:
             ids = ids.to(DEVICE); mask = mask.to(DEVICE); feats = feats.to(DEVICE)
             y30 = y30.to(DEVICE); y60 = y60.to(DEVICE); y120 = y120.to(DEVICE)
-            m30 = m30.to(DEVICE); m60 = m60.to(DEVICE); m120 = m120.to(DEVICE)
+            r30 = r30.to(DEVICE); r60 = r60.to(DEVICE); r120 = r120.to(DEVICE)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_ctx(USE_AMP and DEVICE=="cuda"):
                 (o30,o60,o120), (g30,g60,g120) = model(ids, mask, feats)
                 loss_dir = dir30_loss(o30,y30) + dir60_loss(o60,y60) + dir120_loss(o120,y120)
-                loss_mag = mag_loss(g30,m30) + mag_loss(g60,m60) + mag_loss(g120,m120)
-                loss = LAMBDA_DIR*loss_dir + LAMBDA_MAG*loss_mag
+                loss_ret = ret_loss(g30,r30) + ret_loss(g60,r60) + ret_loss(g120,r120)
+                loss = LAMBDA_DIR*loss_dir + LAMBDA_RET*loss_ret
 
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -474,7 +537,7 @@ def main():
             # Affichage séparé des pertes (ajout sans rien retirer)
             loop.set_postfix(loss=float(loss.item()),
                              loss_dir=float(loss_dir.item()),
-                             loss_mag=float(loss_mag.item()))
+                             loss_ret=float(loss_ret.item()))
 
         tr_loss /= max(1, len(train_loader))
 
@@ -487,9 +550,9 @@ def main():
         msg = (f"[epoch {ep}] train_loss={tr_loss:.4f} | "
                f"dir_acc:30={res[30]['dir_acc']:.3f} 60={res[60]['dir_acc']:.3f} 120={res[120]['dir_acc']:.3f} | "
                f"dir_f1:30={res[30]['dir_f1']:.3f} 60={res[60]['dir_f1']:.3f} 120={res[120]['dir_f1']:.3f} | "
-               f"mag_mae:30={res[30]['mag_mae']:.4f} 60={res[60]['mag_mae']:.4f} 120={res[120]['mag_mae']:.4f} | "
+               f"ret_mae:30={res[30]['ret_mae']:.4f} 60={res[60]['ret_mae']:.4f} 120={res[120]['ret_mae']:.4f} | "
                f"mag_cls_acc:30={res[30]['mag_acc_cls']:.3f} 60={res[60]['mag_acc_cls']:.3f} 120={res[120]['mag_acc_cls']:.3f} | "
-               f"mag_spr:30={res[30]['mag_spearman']:.3f} 60={res[60]['mag_spearman']:.3f} 120={res[120]['mag_spearman']:.3f}")
+               f"ret_spr:30={res[30]['ret_spearman']:.3f} 60={res[60]['ret_spearman']:.3f} 120={res[120]['ret_spearman']:.3f}")
         print(msg)
         logf.write(msg + "\n"); logf.flush()
         save_jsonl(metrics_path, {"epoch": ep, "metrics": res, "train_loss": tr_loss})
@@ -519,8 +582,8 @@ def main():
 
         # Rapports magnitude (classification via seuils train)
         for h in [30,60,120]:
-            tm = np.array(res[h]["mag_y_true"], float)
-            pm = np.array(res[h]["mag_y_pred"], float)
+            tm = np.array(res[h]["abs_y_true"], float)
+            pm = np.array(res[h]["abs_y_pred"], float)
             q1 = thresholds[str(h)]["q1"]; q2 = thresholds[str(h)]["q2"]
             tm_cls = np.array([mag_to_class(x,q1,q2) for x in tm])
             pm_cls = np.array([mag_to_class(x,q1,q2) for x in pm])
@@ -540,9 +603,6 @@ def main():
     logf.close()
     print("[done] best mean dir acc =", round(best_key,3))
 
-    logf.close()
-    print("[done] best mean dir acc =", round(best_key,3))
-
     # Sauvegarde automatique dans le log global
     from log_utils import append_run_log, default_params, print_training_log
     params = default_params(
@@ -551,12 +611,12 @@ def main():
         batch_size=BATCH_SIZE,
         lr=LR,
         lambda_dir=LAMBDA_DIR,
-        lambda_mag=LAMBDA_MAG,
+        lambda_mag=LAMBDA_RET,
         gamma_focal=FOCAL_GAMMA,
         best_mean_dir_acc=best_key,
         best_dir_f1=(res[30]["dir_f1"] + res[60]["dir_f1"] + res[120]["dir_f1"]) / 3,
         val_loss=tr_loss,
-        notes="priorité direction + focal renforcé"
+        notes="direction prioritaire + régression retour signé"
     )
     append_run_log(params)
     print_training_log()

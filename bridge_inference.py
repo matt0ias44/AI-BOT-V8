@@ -10,10 +10,12 @@ Bridge inference v2.
 
 from __future__ import annotations
 
+import csv
 import json
 import time
 from pathlib import Path
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -31,6 +33,107 @@ PROCESSED_FILE = Path("live_processed_ids.json")
 
 LABELS = ["bearish", "neutral", "bullish"]
 TARGET_HORIZON = "60"  # use 60m head as primary signal
+
+EXPECTED_RAW_COLUMNS = [
+    "datetime_paris",
+    "datetime_utc",
+    "title",
+    "url",
+    "summary",
+    "source",
+    "news_id",
+]
+
+EXPORTED_FEATURE_KEYS = [
+    "feat_atr_30m_pct",
+    "feat_atr_60m_pct",
+    "feat_realized_vol_60m",
+    "feat_realized_vol_60m_annual",
+    "feat_vol_z_60m",
+    "feat_volume_rate_30m",
+]
+
+
+def _clean_field(value: str | float | int | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    return str(value).strip()
+
+
+def _utc_to_paris(dt_utc: str) -> str:
+    if not dt_utc:
+        return ""
+    ts = pd.to_datetime(dt_utc, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return ""
+    return ts.tz_convert("Europe/Paris").isoformat()
+
+
+def _ensure_news_id(dt_utc: str, title: str, existing: str) -> str:
+    if existing:
+        return existing
+    base_dt = dt_utc.strip()
+    base_title = title.strip()
+    if base_dt and base_title:
+        return f"{base_dt}|{base_title}"
+    if base_title:
+        return base_title
+    return base_dt
+
+
+def load_live_raw() -> pd.DataFrame:
+    if not INPUT_CSV.exists():
+        return pd.DataFrame(columns=EXPECTED_RAW_COLUMNS)
+
+    rows: List[Dict[str, str]] = []
+    with INPUT_CSV.open("r", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        next(reader, None)  # skip header
+        for idx, raw in enumerate(reader, start=2):
+            if not raw:
+                continue
+            try:
+                if len(raw) >= len(EXPECTED_RAW_COLUMNS):
+                    mapped = {
+                        col: _clean_field(value)
+                        for col, value in zip(EXPECTED_RAW_COLUMNS, raw)
+                    }
+                elif len(raw) == 5:
+                    dt_utc, title, url, summary, source = (_clean_field(v) for v in raw)
+                    mapped = {
+                        "datetime_utc": dt_utc,
+                        "datetime_paris": _utc_to_paris(dt_utc),
+                        "title": title,
+                        "url": url,
+                        "summary": summary,
+                        "source": source,
+                        "news_id": "",
+                    }
+                else:
+                    print(
+                        f"[WARN] skipping malformed row {idx}: "
+                        f"expected 5 or 7 columns, got {len(raw)}"
+                    )
+                    continue
+
+                mapped["news_id"] = _ensure_news_id(
+                    mapped.get("datetime_utc", ""),
+                    mapped.get("title", ""),
+                    _clean_field(mapped.get("news_id")),
+                )
+                if not mapped.get("datetime_paris"):
+                    mapped["datetime_paris"] = _utc_to_paris(mapped.get("datetime_utc", ""))
+                rows.append(mapped)
+            except Exception as exc:
+                print(f"[WARN] unable to parse row {idx}: {exc}")
+
+    if not rows:
+        return pd.DataFrame(columns=EXPECTED_RAW_COLUMNS)
+
+    df = pd.DataFrame(rows, columns=EXPECTED_RAW_COLUMNS)
+    return df
 
 
 class MultiModalHead(nn.Module):
@@ -71,7 +174,16 @@ class MultiModalHead(nn.Module):
         return (o_dir30, o_dir60, o_dir120), (o_mag30, o_mag60, o_mag120)
 
 
-def load_model_assets(model_dir: Path):
+@dataclass
+class InferenceAssets:
+    model: MultiModalHead
+    tokenizer: AutoTokenizer
+    feat_norm: Dict[str, Dict[str, float]]
+    feat_cols: List[str]
+    thresholds: Optional[Dict[str, Dict[str, float]]]
+
+
+def load_model_assets(model_dir: Path) -> InferenceAssets:
     with open(model_dir / "feature_norm.json", "r", encoding="utf-8") as f:
         feat_norm = json.load(f)
     feat_cols = list(feat_norm.keys())
@@ -82,13 +194,19 @@ def load_model_assets(model_dir: Path):
     model.load_state_dict(torch.load(state_path, map_location=DEVICE))
     model.eval()
 
-    thresholds = None
+    thresholds: Optional[Dict[str, Dict[str, float]]] = None
     thresh_path = model_dir / "thresholds_mag.json"
     if thresh_path.exists():
         with open(thresh_path, "r", encoding="utf-8") as f:
             thresholds = json.load(f)
 
-    return model, tokenizer, feat_norm, feat_cols, thresholds
+    return InferenceAssets(
+        model=model,
+        tokenizer=tokenizer,
+        feat_norm=feat_norm,
+        feat_cols=feat_cols,
+        thresholds=thresholds,
+    )
 
 
 def normalize_features(feat_norm: Dict[str, Dict[str, float]], feats: Dict[str, float], feat_cols: List[str]):
@@ -116,9 +234,10 @@ def magnitude_bucket(thresholds: Dict[str, Dict[str, float]] | None, value: floa
     q2 = bucket.get("q2", 0.0)
     if np.isnan(value):
         return "unknown"
-    if value < q1:
+    abs_val = abs(value)
+    if abs_val < q1:
         return "small"
-    if value < q2:
+    if abs_val < q2:
         return "medium"
     return "large"
 
@@ -135,7 +254,12 @@ def ensure_output_header():
         "prob_neut",
         "prob_bull",
         "confidence",
+        "ret_pred",
+        "ret_30m_pred",
+        "ret_120m_pred",
         "mag_pred",
+        "mag_30m_pred",
+        "mag_120m_pred",
         "mag_bucket",
         "features_status",
         "title",
@@ -144,6 +268,7 @@ def ensure_output_header():
         "source",
         "processed_at",
     ]
+    header.extend(EXPORTED_FEATURE_KEYS)
     OUTPUT_CSV.write_text(",".join(header) + "\n", encoding="utf-8")
 
 
@@ -174,7 +299,7 @@ def run_loop():
     if not MODEL_DIR.exists():
         raise FileNotFoundError(f"Model directory not found: {MODEL_DIR}")
 
-    model, tokenizer, feat_norm, feat_cols, thresholds = load_model_assets(MODEL_DIR)
+    assets = load_model_assets(MODEL_DIR)
     feature_builder = LiveFeatureBuilder(FeatureSource())
     processed_ids = load_processed_ids()
     processed_set = set(processed_ids)
@@ -188,7 +313,7 @@ def run_loop():
                 time.sleep(2)
                 continue
 
-            df = pd.read_csv(INPUT_CSV)
+            df = load_live_raw()
             if df.empty:
                 time.sleep(2)
                 continue
@@ -220,12 +345,12 @@ def run_loop():
                     feats = feature_builder.build(event_time)
                 except Exception as exc:
                     print(f"[WARN] feature builder failed for {news_id}: {exc}; fallback to means")
-                    feats = fallback_features(feat_norm)
+                    feats = fallback_features(assets.feat_norm)
                     features_status = "fallback_means"
 
-                Xf = normalize_features(feat_norm, feats, feat_cols)
+                Xf = normalize_features(assets.feat_norm, feats, assets.feat_cols)
 
-                enc = tokenizer(
+                enc = assets.tokenizer(
                     body_text,
                     truncation=True,
                     padding="max_length",
@@ -236,15 +361,20 @@ def run_loop():
                 mask = enc["attention_mask"].to(DEVICE)
 
                 with torch.no_grad():
-                    (o30, o60, o120), (g30, g60, g120) = model(ids, mask, Xf)
+                    (o30, o60, o120), (g30, g60, g120) = assets.model(ids, mask, Xf)
 
                 logits = o60
                 probs = torch.softmax(logits, dim=-1).cpu().numpy().reshape(-1)
                 pred_idx = int(probs.argmax())
                 label = LABELS[pred_idx]
                 confidence = float(probs[pred_idx])
-                mag_val = float(g60.cpu().numpy().reshape(-1)[0])
-                bucket = magnitude_bucket(thresholds, mag_val)
+                ret_30 = float(g30.cpu().numpy().reshape(-1)[0])
+                ret_60 = float(g60.cpu().numpy().reshape(-1)[0])
+                ret_120 = float(g120.cpu().numpy().reshape(-1)[0])
+                mag_val = abs(ret_60)
+                bucket = magnitude_bucket(assets.thresholds, ret_60)
+
+                feature_exports = {key: feats.get(key) for key in EXPORTED_FEATURE_KEYS}
 
                 processed_ids.append(news_id)
                 processed_set.add(news_id)
@@ -262,7 +392,12 @@ def run_loop():
                     "prob_neut": round(float(probs[1]), 6),
                     "prob_bull": round(float(probs[2]), 6),
                     "confidence": round(confidence, 6),
+                    "ret_pred": round(ret_60, 6),
+                    "ret_30m_pred": round(ret_30, 6),
+                    "ret_120m_pred": round(ret_120, 6),
                     "mag_pred": round(mag_val, 6),
+                    "mag_30m_pred": round(abs(ret_30), 6),
+                    "mag_120m_pred": round(abs(ret_120), 6),
                     "mag_bucket": bucket,
                     "features_status": features_status,
                     "title": title,
@@ -271,12 +406,13 @@ def run_loop():
                     "source": source,
                     "processed_at": pd.Timestamp.utcnow().isoformat(),
                 }
+                out_row.update({k: (None if v is None else float(v)) for k, v in feature_exports.items()})
 
                 df_out = pd.DataFrame([out_row])
                 df_out.to_csv(OUTPUT_CSV, mode="a", header=False, index=False)
                 print(
                     f"[PRED] {news_id} | {label} conf={confidence:.2f} "
-                    f"bull={probs[2]:.2f} bear={probs[0]:.2f} mag={mag_val:.4f}"
+                    f"bull={probs[2]:.2f} bear={probs[0]:.2f} ret={ret_60:.4f} mag={mag_val:.4f}"
                 )
         except Exception as exc:
             print("[ERROR]", exc)
