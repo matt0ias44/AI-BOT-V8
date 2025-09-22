@@ -18,7 +18,7 @@ prévoit simultanément la direction et l'amplitude du mouvement.
 
 import argparse
 from datetime import timedelta
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -48,10 +48,10 @@ def compute_direction(ret: float, atr_pct: Optional[float]) -> str:
     return "neutral"
 
 
-def compute_labels(ev_time: pd.Timestamp, prices: pd.DataFrame, horizons: Iterable[int]) -> Dict[str, float | str]:
+def compute_labels(ev_time: pd.Timestamp, prices: pd.DataFrame, horizons: Iterable[int]) -> Dict[str, Union[float, str]]:
     """Calcule labels directionnels, rendements et magnitudes pour un événement."""
 
-    out: Dict[str, float | str] = {}
+    out: Dict[str, Union[float, str]] = {}
     if ev_time.tzinfo is None:
         ev_time = ev_time.tz_localize("UTC")
 
@@ -110,18 +110,31 @@ def main():
 
     print("[i] Chargement OHLCV...")
     prices = pd.read_csv(args.ohlcv)
-    if "open_time" in prices.columns:
-        prices["ts"] = pd.to_datetime(prices["open_time"], unit="ms", utc=True)
-    elif "ts" in prices.columns:
-        prices["ts"] = pd.to_datetime(prices["ts"], utc=True)
-    else:
-        raise ValueError("OHLCV doit contenir 'open_time' ou 'ts'")
-
     prices = prices.rename(columns={c: c.lower() for c in prices.columns})
+
+    if "open_time" in prices.columns:
+        prices["ts"] = pd.to_datetime(prices["open_time"], unit="ms", utc=True, errors="coerce")
+    elif "ts" in prices.columns:
+        prices["ts"] = pd.to_datetime(prices["ts"], utc=True, errors="coerce")
+    elif "timestamp" in prices.columns:
+        ts_raw = prices["timestamp"]
+        if np.issubdtype(ts_raw.dtype, np.number):
+            unit = "ms" if ts_raw.max() > 1e11 else "s"
+            prices["ts"] = pd.to_datetime(ts_raw, unit=unit, utc=True, errors="coerce")
+        else:
+            prices["ts"] = pd.to_datetime(ts_raw, utc=True, errors="coerce")
+    else:
+        raise ValueError("OHLCV doit contenir 'open_time', 'ts' ou 'timestamp'")
+
     if "close" not in prices.columns:
         raise ValueError("OHLCV doit contenir une colonne close")
 
-    prices = prices.drop_duplicates(subset=["ts"]).set_index("ts").sort_index()
+    prices = (
+        prices.dropna(subset=["ts"])
+        .drop_duplicates(subset=["ts"])
+        .set_index("ts")
+        .sort_index()
+    )
 
     # Calcul ATR & volatilité réalisée pour définir des seuils dynamiques
     high = prices.get("high", prices["close"])
@@ -134,7 +147,8 @@ def main():
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
     atr_30 = tr.rolling(30).mean()
-    prices[ATR_COL] = (atr_30 / close).fillna(method="ffill")
+    atr_ratio = atr_30 / close
+    prices[ATR_COL] = atr_ratio.ffill()
 
     # Remplissage forward pour éviter les trous dans l'index temporel
     full_idx = pd.date_range(prices.index.min(), prices.index.max(), freq="1min", tz="UTC")
