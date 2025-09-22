@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +24,7 @@ import requests
 PRED_FILE = Path("live_predictions.csv")
 PRICE_FILE = Path("price_pipe.csv")
 STATE_FILE = Path("bot_state.json")
-MODEL_DIR = Path("./models/bert_v7_1_multi")
+MODEL_DIR = Path(os.environ.get("MODEL_DIR", "./models/bert_v7_1_plus"))
 REFRESH_SEC = 2
 
 CONF_OPEN = 0.62
@@ -186,7 +187,16 @@ def init_state() -> Dict:
     if STATE_FILE.exists():
         try:
             with STATE_FILE.open("r", encoding="utf-8") as fh:
-                return json.load(fh)
+                data = json.load(fh)
+                if isinstance(data, dict):
+                    data.setdefault("starting_equity", 10000.0)
+                    data.setdefault("equity", data.get("starting_equity", 10000.0))
+                    data.setdefault("position", None)
+                    data.setdefault("trades", [])
+                    data.setdefault("equity_curve", [[now_iso(), data.get("equity", 10000.0)]])
+                    data.setdefault("last_pred_id", None)
+                    data.setdefault("last_signal", None)
+                    return data
         except Exception as exc:
             print(f"[WARN] unable to read {STATE_FILE}: {exc}")
     return {
@@ -196,6 +206,7 @@ def init_state() -> Dict:
         "trades": [],
         "equity_curve": [[now_iso(), 10000.0]],
         "last_pred_id": None,
+        "last_signal": None,
     }
 
 
@@ -251,6 +262,13 @@ def latest_predictions(n: int = 40) -> pd.DataFrame:
         "feat_realized_vol_60m_annual",
         "feat_vol_z_60m",
         "feat_volume_rate_30m",
+        "article_status",
+        "article_found",
+        "article_chars",
+        "text_source",
+        "text_chars",
+        "titles_joined",
+        "body_concat",
     }
     for col in required:
         if col not in df.columns:
@@ -278,6 +296,9 @@ def close_position(state: Dict, price: float, reason: str = "CLOSE") -> None:
             "title": pos.get("title", ""),
             "leverage": pos.get("leverage", 1),
             "risk_fraction": round(float(pos.get("risk_fraction", 0.0)), 4),
+            "confidence": round(float(pos.get("confidence", 0.0)), 4),
+            "ret_pred": round(float(pos.get("ret_pred", 0.0)), 6),
+            "article_status": pos.get("article_status"),
         }
     )
     state["position"] = None
@@ -304,6 +325,11 @@ def open_position(state: Dict, side: str, price: float, title: str, plan: Dict) 
         "risk_budget": plan.get("risk_budget", 0.0),
         "atr_pct": plan.get("atr_pct"),
         "confidence": plan.get("confidence", 0.0),
+        "article_status": plan.get("article_status"),
+        "article_found": plan.get("article_found"),
+        "text_source": plan.get("text_source"),
+        "article_chars": plan.get("article_chars"),
+        "text_chars": plan.get("text_chars"),
     }
     state["trades"].append(
         {
@@ -315,6 +341,9 @@ def open_position(state: Dict, side: str, price: float, title: str, plan: Dict) 
             "title": title[:160],
             "leverage": leverage,
             "risk_fraction": round(plan.get("risk_fraction", 0.0), 4),
+            "confidence": round(plan.get("confidence", 0.0), 4),
+            "ret_pred": round(plan.get("ret_pred", 0.0), 6),
+            "article_status": plan.get("article_status"),
         }
     )
 
@@ -373,10 +402,51 @@ def main():
                 mag_value = abs(ret_pred)
                 atr_pct = safe_float(last_row.get("feat_atr_60m_pct"))
                 title = str(last_row.get("title", ""))
+                article_status = str(last_row.get("article_status", ""))
+                article_found = bool(last_row.get("article_found", False))
+                article_chars = int(float(last_row.get("article_chars", 0) or 0))
+                text_source = str(last_row.get("text_source", ""))
+                url = str(last_row.get("url", ""))
+
+                text_chars = int(float(last_row.get("text_chars", 0) or 0))
+
+                plan = build_risk_plan(state, confidence, ret_pred, thresholds, atr_pct)
+                if plan:
+                    plan.setdefault("article_status", article_status)
+                    plan.setdefault("article_found", article_found)
+                    plan.setdefault("text_source", text_source)
+                    plan.setdefault("article_chars", article_chars)
+                    plan.setdefault("text_chars", text_chars)
+
+                signal_info = {
+                    "time": now_iso(),
+                    "news_id": news_id,
+                    "prediction": pred,
+                    "confidence": float(confidence),
+                    "ret_pred": float(ret_pred),
+                    "mag_pred": float(mag_value),
+                    "atr_pct": None if atr_pct is None else float(atr_pct),
+                    "article_status": article_status,
+                    "article_found": article_found,
+                    "article_chars": article_chars,
+                    "text_chars": text_chars,
+                    "text_source": text_source,
+                    "title": title[:200],
+                    "url": url,
+                    "features_status": str(last_row.get("features_status", "")),
+                }
+                if plan:
+                    signal_info.update(
+                        {
+                            "planned_leverage": plan.get("leverage"),
+                            "risk_fraction": plan.get("risk_fraction"),
+                            "risk_budget": plan.get("risk_budget"),
+                        }
+                    )
+                state["last_signal"] = signal_info
 
                 now_s = time.time()
                 if now_s - last_action_ts >= MIN_COOLDOWN_SEC:
-                    plan = build_risk_plan(state, confidence, ret_pred, thresholds, atr_pct)
                     if state.get("position") is None:
                         if pred == "bullish" and confidence >= CONF_OPEN and price and plan:
                             open_position(state, "long", price, title, plan)

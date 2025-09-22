@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import time
-from pathlib import Path
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -23,13 +25,15 @@ import torch
 from torch import nn
 from transformers import AutoTokenizer, AutoModel
 
-from live.feature_builder import LiveFeatureBuilder, FeatureSource
+from fetch_article_bodies import fetch_article_body
+from live.feature_builder import FeatureSource, LiveFeatureBuilder
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_DIR = Path("./models/bert_v7_1_multi")
+MODEL_DIR = Path(os.environ.get("MODEL_DIR", "./models/bert_v7_1_plus"))
 INPUT_CSV = Path("live_raw.csv")
 OUTPUT_CSV = Path("live_predictions.csv")
 PROCESSED_FILE = Path("live_processed_ids.json")
+ARTICLE_CACHE_FILE = Path("live_article_cache.json")
 
 LABELS = ["bearish", "neutral", "bullish"]
 TARGET_HORIZON = "60"  # use 60m head as primary signal
@@ -53,6 +57,73 @@ EXPORTED_FEATURE_KEYS = [
     "feat_vol_z_60m",
     "feat_volume_rate_30m",
 ]
+
+MAX_ARTICLE_CACHE = 400
+
+
+def load_article_cache() -> Dict[str, Dict[str, str]]:
+    if not ARTICLE_CACHE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(ARTICLE_CACHE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception as exc:
+        print(f"[WARN] unable to load article cache: {exc}")
+    return {}
+
+
+def save_article_cache(cache: Dict[str, Dict[str, str]]) -> None:
+    items = sorted(
+        cache.items(),
+        key=lambda kv: kv[1].get("fetched_at", ""),
+        reverse=True,
+    )[:MAX_ARTICLE_CACHE]
+    trimmed = {k: v for k, v in items}
+    tmp = ARTICLE_CACHE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(trimmed, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(ARTICLE_CACHE_FILE)
+
+
+def fetch_article_with_cache(url: str, cache: Dict[str, Dict[str, str]]) -> tuple[str, str]:
+    if not url:
+        return "", "no_url"
+    entry = cache.get(url)
+    if entry:
+        body = entry.get("body", "")
+        status = entry.get("status", "cached" if body else "empty")
+        return body, status
+    body = fetch_article_body(url)
+    status = "fetched" if body else "empty"
+    cache[url] = {
+        "body": body,
+        "status": status,
+        "fetched_at": datetime.utcnow().isoformat(),
+    }
+    try:
+        save_article_cache(cache)
+    except Exception as exc:
+        print(f"[WARN] unable to persist article cache: {exc}")
+    return body, status
+
+
+def build_text_payload(title: str, summary: str, body: str) -> tuple[str, str, str, str]:
+    title_clean = (title or "").strip()
+    summary_clean = (summary or "").strip()
+    body_clean = (body or "").strip()
+
+    titles_joined = title_clean
+    body_concat_parts = [part for part in [summary_clean, body_clean] if part]
+    body_concat = "\n\n".join(body_concat_parts) if body_concat_parts else title_clean
+    text_parts = [part for part in [titles_joined, body_concat] if part]
+    text_for_model = "\n\n".join(text_parts)
+    if body_clean:
+        source = "article"
+    elif summary_clean:
+        source = "summary"
+    else:
+        source = "title"
+    return text_for_model or title_clean, titles_joined, body_concat, source
 
 
 
@@ -141,7 +212,18 @@ def load_live_raw() -> pd.DataFrame:
 class MultiModalHead(nn.Module):
     def __init__(self, model_name: str, feat_dim: int, hidden_drop: float = 0.2):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name, use_safetensors=True)
+        load_kwargs = {"use_safetensors": True, "low_cpu_mem_usage": True}
+        if DEVICE == "cuda":
+            load_kwargs["torch_dtype"] = torch.float16
+
+        try:
+            self.backbone = AutoModel.from_pretrained(model_name, **load_kwargs)
+        except OSError as err:
+            if "paging file" in str(err).lower() or "1455" in str(err):
+                load_kwargs.pop("use_safetensors", None)
+                self.backbone = AutoModel.from_pretrained(model_name, **load_kwargs)
+            else:
+                raise
         hidden = self.backbone.config.hidden_size
         self.feat_mlp = nn.Sequential(
             nn.Linear(feat_dim, hidden),
@@ -165,7 +247,11 @@ class MultiModalHead(nn.Module):
     def forward(self, input_ids, attention_mask, feats):
         out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
         cls = out.last_hidden_state[:, 0]
+        if feats.dtype != cls.dtype:
+            feats = feats.to(cls.dtype)
         f = self.feat_mlp(feats)
+        if f.dtype != cls.dtype:
+            f = f.to(cls.dtype)
         z = self.fuse(torch.cat([cls, f], dim=-1))
         o_dir30 = self.dir30(z)
         o_dir60 = self.dir60(z)
@@ -268,6 +354,13 @@ def ensure_output_header():
         "summary",
         "url",
         "source",
+        "titles_joined",
+        "body_concat",
+        "text_source",
+        "text_chars",
+        "article_status",
+        "article_found",
+        "article_chars",
         "processed_at",
     ]
     header.extend(EXPORTED_FEATURE_KEYS)
@@ -302,10 +395,11 @@ def run_loop():
         raise FileNotFoundError(f"Model directory not found: {MODEL_DIR}")
 
     assets = load_model_assets(MODEL_DIR)
-    feature_builder = LiveFeatureBuilder(FeatureSource())
+    feature_builder = LiveFeatureBuilder(FeatureSource(), feat_stats=assets.feat_norm)
     processed_ids = load_processed_ids()
     processed_set = set(processed_ids)
     ensure_output_header()
+    article_cache = load_article_cache()
 
     print("[INFO] Bridge inference v2 started. Watching", INPUT_CSV)
 
@@ -334,7 +428,24 @@ def run_loop():
                 summary = str(row.get("summary", ""))
                 url = str(row.get("url", ""))
                 source = str(row.get("source", ""))
-                body_text = " ".join(part for part in [title, summary] if part)
+
+                article_body, article_status = fetch_article_with_cache(url, article_cache)
+                text_for_model, titles_joined, body_concat, text_source = build_text_payload(
+                    title,
+                    summary,
+                    article_body,
+                )
+                article_chars = len(article_body.strip()) if article_body else 0
+                article_found = bool(article_body and article_chars >= 200)
+                if article_found:
+                    article_status = f"{article_status}_full"
+                elif article_body:
+                    article_status = f"{article_status}_short"
+                elif summary:
+                    article_status = f"{article_status}_summary"
+                else:
+                    article_status = f"{article_status}_title"
+                text_chars = len(text_for_model)
 
                 dt_paris = pd.to_datetime(row.get("datetime_paris"), utc=True, errors="coerce")
                 dt_utc = pd.to_datetime(row.get("datetime_utc"), utc=True, errors="coerce")
@@ -343,8 +454,18 @@ def run_loop():
                 event_time = dt_utc.to_pydatetime()
 
                 features_status = "live"
+                sentiment_val = 0.0
+                for sent_key in ("sentiment_score", "sentiment"):
+                    raw_sent = row.get(sent_key)
+                    if raw_sent is None or raw_sent == "":
+                        continue
+                    try:
+                        sentiment_val = float(raw_sent)
+                        break
+                    except (TypeError, ValueError):
+                        continue
                 try:
-                    feats = feature_builder.build(event_time)
+                    feats = feature_builder.build(event_time, sentiment=sentiment_val)
                 except Exception as exc:
                     print(f"[WARN] feature builder failed for {news_id}: {exc}; fallback to means")
                     feats = fallback_features(assets.feat_norm)
@@ -353,7 +474,7 @@ def run_loop():
                 Xf = normalize_features(assets.feat_norm, feats, assets.feat_cols)
 
                 enc = assets.tokenizer(
-                    body_text,
+                    text_for_model,
                     truncation=True,
                     padding="max_length",
                     max_length=256,
@@ -378,9 +499,6 @@ def run_loop():
                 bucket = magnitude_bucket(assets.thresholds, ret_60)
 
                 feature_exports = {key: feats.get(key) for key in EXPORTED_FEATURE_KEYS}
-
-                mag_val = float(g60.cpu().numpy().reshape(-1)[0])
-                bucket = magnitude_bucket(assets.thresholds, mag_val)
 
 
                 processed_ids.append(news_id)
@@ -411,6 +529,13 @@ def run_loop():
                     "summary": summary,
                     "url": url,
                     "source": source,
+                    "titles_joined": titles_joined,
+                    "body_concat": body_concat,
+                    "text_source": text_source,
+                    "text_chars": int(text_chars),
+                    "article_status": article_status,
+                    "article_found": bool(article_found),
+                    "article_chars": int(article_chars),
                     "processed_at": pd.Timestamp.utcnow().isoformat(),
                 }
                 out_row.update({k: (None if v is None else float(v)) for k, v in feature_exports.items()})
