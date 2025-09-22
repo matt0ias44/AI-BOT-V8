@@ -18,7 +18,7 @@ Prérequis dataset :
   * feat_* (features marché à t0)
 
 Sorties :
-- models/bert_v7_1_multi/
+- models/bert_v7_1_plus/ (par défaut — overridable via $OUTPUT_DIR)
   * poids + tokenizer
   * best.json
   * training_log.txt, metrics_log.jsonl
@@ -56,7 +56,7 @@ LR = 3e-5
 WEIGHT_DECAY = 0.01
 WARMUP_FRAC = 0.05
 
-OUTPUT_DIR = "models/bert_v7_1_multi"
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "models/bert_v7_1_plus")
 SEED = 42
 USE_AMP = True
 EARLY_STOP_PATIENCE = 2

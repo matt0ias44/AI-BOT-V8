@@ -18,6 +18,8 @@ All timestamps exposed to users are aligned on Europe/Paris.
 
 Historic data preparation and training scripts remain under the root directory. The main entry point is `train_model_v7_1_multi.py`, which expects the dataset produced by `prepare_dataset_full.py` and the helpers in `attach_market_features.py`.
 
+> **Export tip** — The trainer now writes to `models/bert_v7_1_plus/` by default so the live stack picks up fresh checkpoints automatically. Override the target with `OUTPUT_DIR=/path/to/export python train_model_v7_1_multi.py` if you need to keep multiple runs side by side.
+
 ## Quick start (live stack)
 
 ```
