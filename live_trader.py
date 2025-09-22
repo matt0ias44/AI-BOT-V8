@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from live.model_paths import resolve_model_dir
+from live.state_utils import (
+    build_last_signal,
+    ensure_state_defaults,
+    load_state_file,
+    save_state_file,
+)
 
 import pandas as pd
 import requests
@@ -190,30 +196,11 @@ def read_last_price() -> Optional[float]:
 
 
 def init_state() -> Dict:
-    if STATE_FILE.exists():
-        try:
-            with STATE_FILE.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-                if isinstance(data, dict):
-                    data.setdefault("starting_equity", 10000.0)
-                    data.setdefault("equity", data.get("starting_equity", 10000.0))
-                    data.setdefault("position", None)
-                    data.setdefault("trades", [])
-                    data.setdefault("equity_curve", [[now_iso(), data.get("equity", 10000.0)]])
-                    data.setdefault("last_pred_id", None)
-                    data.setdefault("last_signal", None)
-                    return data
-        except Exception as exc:
-            print(f"[WARN] unable to read {STATE_FILE}: {exc}")
-    return {
-        "starting_equity": 10000.0,
-        "equity": 10000.0,
-        "position": None,
-        "trades": [],
-        "equity_curve": [[now_iso(), 10000.0]],
-        "last_pred_id": None,
-        "last_signal": None,
-    }
+    state = load_state_file(STATE_FILE)
+    state = ensure_state_defaults(state)
+    if not state.get("equity_curve"):
+        state["equity_curve"] = [[now_iso(), float(state.get("equity", 10000.0))]]
+    return state
 
 
 def save_state(state: Dict) -> None:
@@ -221,9 +208,7 @@ def save_state(state: Dict) -> None:
         state["equity_curve"] = state["equity_curve"][-5000:]
     if len(state.get("trades", [])) > 2000:
         state["trades"] = state["trades"][-2000:]
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    save_state_file(STATE_FILE, state)
 
 
 def load_thresholds() -> Optional[Dict[str, Dict[str, float]]]:
@@ -424,31 +409,23 @@ def main():
                     plan.setdefault("article_chars", article_chars)
                     plan.setdefault("text_chars", text_chars)
 
-                signal_info = {
-                    "time": now_iso(),
-                    "news_id": news_id,
-                    "prediction": pred,
-                    "confidence": float(confidence),
-                    "ret_pred": float(ret_pred),
-                    "mag_pred": float(mag_value),
-                    "atr_pct": None if atr_pct is None else float(atr_pct),
-                    "article_status": article_status,
-                    "article_found": article_found,
-                    "article_chars": article_chars,
-                    "text_chars": text_chars,
-                    "text_source": text_source,
-                    "title": title[:200],
-                    "url": url,
-                    "features_status": str(last_row.get("features_status", "")),
-                }
-                if plan:
-                    signal_info.update(
-                        {
-                            "planned_leverage": plan.get("leverage"),
-                            "risk_fraction": plan.get("risk_fraction"),
-                            "risk_budget": plan.get("risk_budget"),
-                        }
-                    )
+                signal_info = build_last_signal(
+                    news_id=news_id,
+                    prediction=pred,
+                    confidence=confidence,
+                    ret_pred=ret_pred,
+                    mag_pred=mag_value,
+                    atr_pct=atr_pct,
+                    article_status=article_status,
+                    article_found=article_found,
+                    article_chars=article_chars,
+                    text_chars=text_chars,
+                    text_source=text_source,
+                    title=title,
+                    url=url,
+                    features_status=str(last_row.get("features_status", "")),
+                    plan=plan,
+                )
                 state["last_signal"] = signal_info
 
                 now_s = time.time()

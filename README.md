@@ -42,6 +42,7 @@ Optional: run `python live/price_pipe_writer.py` standalone if you need to feed 
 - `bridge_inference.py`: unified inference loop (direction + magnitude).
 - `live_trader.py`: paper trading engine with dynamic sizing.
 - `app.py`: Streamlit dashboard.
+- `live/state_utils.py`: shared helpers to load/save the bot state and normalise last-signal payloads.
 - `legacy/`: previous live scripts kept for reference.
 - `models/`: trained artifacts.
 - `data/`, `strategies/`, `notebooks/`: historical data and experiments.

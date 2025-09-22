@@ -19,6 +19,7 @@ from pytz import timezone as pytz_timezone
 from streamlit_autorefresh import st_autorefresh
 
 from live.model_paths import resolve_model_dir
+from live.state_utils import default_state, load_state_file
 
 warnings.filterwarnings("ignore", message=".*Styler.applymap.*", category=FutureWarning)
 
@@ -39,17 +40,6 @@ BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"]
 REFRESH_SEC = 5
-
-DEFAULT_STATE = {
-    "starting_equity": 10000.0,
-    "equity": 10000.0,
-    "position": None,
-    "trades": [],
-    "equity_curve": [],
-    "last_pred_id": None,
-    "last_signal": None,
-}
-
 
 def humanize_delta(delta: timedelta) -> str:
     seconds = max(int(delta.total_seconds()), 0)
@@ -139,15 +129,11 @@ def now_paris_str() -> str:
 
 
 def load_state() -> Dict[str, Any]:
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            for key, value in DEFAULT_STATE.items():
-                state.setdefault(key, value)
-            return state
-        except Exception as exc:
-            st.warning(f"Unable to load bot_state.json: {exc}")
-    return DEFAULT_STATE.copy()
+    try:
+        return load_state_file(STATE_FILE, strict=True)
+    except Exception as exc:
+        st.warning(f"Unable to load bot_state.json: {exc}")
+        return default_state()
 
 
 def load_predictions() -> pd.DataFrame:
