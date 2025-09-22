@@ -8,7 +8,7 @@ This repository contains the tooling used to collect crypto news, transform them
 
 1. **News ingestion**: `node rss_to_csv.js` writes deduplicated items (Paris time) into `live_raw.csv`.
 2. **Price pipe writer**: `python live/price_pipe_writer.py` keeps `price_pipe.csv` fresh with Binance BTCUSDT quotes (auto-launched by `run_live_stack.py`).
-3. **Inference bridge**: `python bridge_inference.py` watches `live_raw.csv`, builds market features, runs the multimodal model, and appends rows to `live_predictions.csv`.
+3. **Inference bridge**: `python bridge_inference.py` watches `live_raw.csv`, fetches full article bodies, rebuilds the same market/context features used during training, runs the multimodal model, and appends rows (with article/feature diagnostics) to `live_predictions.csv`.
 4. **Paper trader**: `python live_trader.py` transforms predictions into positions, updates `bot_state.json`, and tracks equity.
 5. **Dashboard**: `streamlit run app.py` shows the BTC chart, predictions, trades, and the equity curve.
 
@@ -31,6 +31,8 @@ node rss_to_csv.js
 ```
 
 Optional: run `python live/price_pipe_writer.py` standalone if you need to feed `price_pipe.csv` manually (two columns: `timestamp,price`). `run_live_stack.py` launches it for you, and `live_trader.py` still falls back to Binance public prices if the file is absent.
+
+> **Model switcher** — Set `MODEL_DIR=/path/to/models/bert_v7_1_plus` (or your preferred export) before starting the stack to point both the bridge, trader, and dashboard to the right checkpoint. If unset, the stack now auto-detects `models/bert_v7_1_plus/` and falls back to `models/bert_v7_1_multi/` when the newer export is absent.
 
 ## Repository structure
 

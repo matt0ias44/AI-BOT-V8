@@ -18,14 +18,19 @@ import streamlit as st
 from pytz import timezone as pytz_timezone
 from streamlit_autorefresh import st_autorefresh
 
+from live.model_paths import resolve_model_dir
+
 warnings.filterwarnings("ignore", message=".*Styler.applymap.*", category=FutureWarning)
 
 TZ_PARIS = pytz_timezone("Europe/Paris")
 APP_ROOT = Path(__file__).resolve().parent
-
 PREDICTIONS_CSV = APP_ROOT / "live_predictions.csv"
 STATE_FILE = APP_ROOT / "bot_state.json"
-MODEL_DIR = APP_ROOT / "models/bert_v7_1_multi"
+MODEL_DIR = resolve_model_dir(
+    base_dir=APP_ROOT,
+    env_var="MODEL_DIR",
+    candidates=("models/bert_v7_1_plus", "models/bert_v7_1_multi", "models/bert_v7_multi"),
+)
 LIVE_RAW_FILE = APP_ROOT / "live_raw.csv"
 
 BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
@@ -42,6 +47,7 @@ DEFAULT_STATE = {
     "trades": [],
     "equity_curve": [],
     "last_pred_id": None,
+    "last_signal": None,
 }
 
 
@@ -214,16 +220,38 @@ def format_prediction_table(df: pd.DataFrame) -> pd.DataFrame:
         view["heure_paris"] = view["datetime_paris"].dt.strftime("%d/%m %H:%M:%S")
     else:
         view["heure_paris"] = ""
+
+    for required in ["confidence", "ret_pred", "mag_pred", "article_found", "article_chars", "article_status", "text_source"]:
+        if required not in view.columns:
+            if required in {"article_status", "text_source"}:
+                view[required] = ""
+            else:
+                view[required] = np.nan
+
+    view["confidence"] = pd.to_numeric(view["confidence"], errors="coerce")
+    view["confidence"] = view["confidence"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
+    view["ret_pred_pct"] = pd.to_numeric(view["ret_pred"], errors="coerce").mul(100.0)
+    view["ret_pred_pct"] = view["ret_pred_pct"].map(lambda x: f"{x:+.2f}%" if pd.notna(x) else "")
+    view["mag_pred_pct"] = pd.to_numeric(view["mag_pred"], errors="coerce").abs().mul(100.0)
+    view["mag_pred_pct"] = view["mag_pred_pct"].map(lambda x: f"{x:.2f}%" if pd.notna(x) else "")
+    view["article_found"] = view["article_found"].map(lambda x: "✅" if bool(x) else "❌")
+    view["article_chars"] = pd.to_numeric(view["article_chars"], errors="coerce").fillna(0).astype(int)
+
     cols = [
         "heure_paris",
         "prediction",
+        "confidence",
+        "ret_pred_pct",
         "prob_bull",
         "prob_neut",
         "prob_bear",
-        "confidence",
-        "mag_pred",
+        "mag_pred_pct",
         "mag_bucket",
         "features_status",
+        "article_status",
+        "article_found",
+        "article_chars",
+        "text_source",
         "title",
     ]
     for c in cols:
@@ -248,7 +276,8 @@ rss_ok, rss_detail = check_rss_status()
 model_ok, model_detail = check_model_status(preds_df)
 trader_ok, trader_detail = check_trader_status(state)
 render_status_badge(status_cols[0], "Flux RSS", rss_ok, rss_detail)
-render_status_badge(status_cols[1], "Modèle v7.1", model_ok, model_detail)
+model_label = f"Modèle {MODEL_DIR.name}"
+render_status_badge(status_cols[1], model_label, model_ok, model_detail)
 render_status_badge(status_cols[2], "Trader fictif", trader_ok, trader_detail)
 
 with st.sidebar:
@@ -329,6 +358,46 @@ with col_right:
         kpi_block("Volume 24h", f"{ticker['volume']:.2f}")
     else:
         st.error(f"Unable to fetch ticker: {ticker.get('error') if isinstance(ticker, dict) else 'unknown error'}")
+
+    st.subheader("Dernier signal")
+    last_signal = state.get("last_signal") if isinstance(state, dict) else None
+    if last_signal:
+        pred = str(last_signal.get("prediction", "")).upper()
+        conf_raw = last_signal.get("confidence")
+        try:
+            conf = float(conf_raw) if conf_raw is not None else None
+        except (TypeError, ValueError):
+            conf = None
+        ret_raw = last_signal.get("ret_pred")
+        try:
+            ret_pred = float(ret_raw) if ret_raw is not None else None
+        except (TypeError, ValueError):
+            ret_pred = None
+        mag_pred = abs(ret_pred) if ret_pred is not None else None
+        lev_raw = last_signal.get("planned_leverage")
+        leverage = int(lev_raw) if isinstance(lev_raw, (int, float)) else None
+        risk_raw = last_signal.get("risk_fraction")
+        risk_fraction = float(risk_raw) if isinstance(risk_raw, (int, float)) else None
+        article_status = last_signal.get("article_status", "")
+        article_found = last_signal.get("article_found")
+        text_source = last_signal.get("text_source", "")
+        features_status = last_signal.get("features_status", "")
+        icon = "🟢" if pred == "BULLISH" else ("🔴" if pred == "BEARISH" else "⚪")
+        lines = [
+            f"{icon} **{pred or '—'}** — confiance {conf:.2f}" if conf is not None else f"{icon} **{pred or '—'}**",
+            f"Retour 60m: {ret_pred * 100:+.2f}% (|{mag_pred * 100:.2f}%|)" if ret_pred is not None else "Retour 60m: n/a",
+            f"Levier planifié: x{int(leverage)}" if leverage else "Levier planifié: n/a",
+            f"Risque engagé: {risk_fraction * 100:.2f}%" if isinstance(risk_fraction, (float, int)) else "Risque engagé: n/a",
+            f"Article: {'✅' if article_found else '⚠️'} {article_status or 'inconnu'} ({text_source or 'n/a'})",
+            f"Features: {features_status or 'n/a'}",
+        ]
+        st.markdown("\n".join(f"- {line}" for line in lines if line))
+        if last_signal.get("title"):
+            st.caption(last_signal.get("title"))
+        if last_signal.get("url"):
+            st.markdown(f"[Voir l'article]({last_signal['url']})")
+    else:
+        st.info("En attente d'un signal du modèle.")
 
     st.subheader("Live predictions")
     if not preds_df.empty:
